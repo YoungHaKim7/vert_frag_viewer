@@ -268,8 +268,10 @@ fn disasm_stage(disasm: &str) -> Option<Stage> {
 /// OpEntryPoint instruction (Vertex = 0, Fragment = 4).
 fn binary_stage(bytes: &[u8]) -> Option<Stage> {
     let words: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
         .collect();
 
     let mut offset = 5;
@@ -774,8 +776,10 @@ fn read_spirv(path: &Path) -> Vec<u32> {
     let bytes = fs::read(path).expect("read compiled SPIR-V");
 
     let words: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
         .collect();
 
     assert_eq!(
