@@ -24,6 +24,12 @@
 
 # vert_frag_viewer
 
+# Run
+
+```bash
+cargo r --release ./assets/triangle.vert ./assets/triangle.frag # vertex + fragment shader
+```
+
 # slang viewer
 - https://github.com/YoungHaKim7/slang_files_viewer_shaders
 
