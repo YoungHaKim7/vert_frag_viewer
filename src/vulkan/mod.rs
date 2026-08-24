@@ -75,21 +75,11 @@ impl VulkanApp {
             let swapchain = SwapchainBundle::new(&context);
 
             //
-            // Pipeline for the compiled shader
+            // Pipeline for the compiled shader; shader modules are created
+            // (and dropped) inside, since only pipeline creation needs them.
             //
 
-            let module_info = vk::ShaderModuleCreateInfo::default().code(&compiled.spirv);
-
-            let shader_module = context
-                .device
-                .create_shader_module(&module_info, None)
-                .expect("shader module");
-
-            let pipeline = Pipeline::new(&context, &swapchain, shader_module, &compiled.mode);
-
-            // Pipelines capture the entry point names; the module is no
-            // longer needed.
-            context.device.destroy_shader_module(shader_module, None);
+            let pipeline = Pipeline::new(&context, &swapchain, &compiled.mode);
 
             let commands = Commands::new(&context);
 

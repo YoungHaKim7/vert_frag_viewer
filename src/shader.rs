@@ -1,12 +1,15 @@
-//! Runtime compilation of a user-supplied .slang file via `slangc`.
+//! Runtime compilation of user-supplied shaders.
 //!
-//! The viewer takes the shader path as a command-line argument (or the
-//! source on stdin), compiles the whole module to SPIR-V in one `slangc`
-//! invocation, and inspects the emitted reflection JSON to decide how to
-//! display it:
+//! The viewer accepts either:
 //!
-//! - vertex + fragment entry points  -> graphics pipeline
-//! - compute entry point             -> playground-style compute pass
+//! - one `.slang` module (path or stdin): compiled as a whole in one
+//!   `slangc` invocation, and inspected through the emitted reflection JSON
+//!   to decide how to display it (vertex + fragment -> graphics pipeline,
+//!   compute entry point -> playground-style compute pass);
+//! - a `.vert` + `.frag` pair: each stage is built on its own. SPIR-V
+//!   disassembly (the output of `spirv-dis`, e.g. from the slangc workflow
+//!   in assets/README.md) is assembled with `spirv-as`; plain slang/GLSL
+//!   source is compiled by `slangc -stage`. Raw `.spv` binaries load as-is.
 //!
 //! Playground demos (e.g. the 2D gaussian splatter) rely on a prelude that
 //! the web playground injects (`drawPixel`, the screen-sized output texture,
@@ -42,15 +45,60 @@ pub struct SourceFile {
     pub path: PathBuf,
 }
 
+/// What the user asked to view on the command line.
+pub enum ShaderInput {
+    /// One .slang module compiled as a whole.
+    Module(SourceFile),
+    /// Separate vertex + fragment files built stage by stage.
+    StagePair(StagePair),
+}
+
+/// A vertex + fragment file pair.
+pub struct StagePair {
+    /// Both file names, shown in the window title.
+    pub display_name: String,
+    pub vertex: PathBuf,
+    pub fragment: PathBuf,
+}
+
+/// The two graphics stages a `.vert`/`.frag` pair can supply.
+#[derive(Clone, Copy)]
+enum Stage {
+    Vertex,
+    Fragment,
+}
+
+impl Stage {
+    fn slang_flag(self) -> &'static str {
+        match self {
+            Stage::Vertex => "vertex",
+            Stage::Fragment => "fragment",
+        }
+    }
+
+    /// Entry-point keyword used in SPIR-V disassembly
+    /// (`OpEntryPoint Vertex ...` / `OpEntryPoint Fragment ...`).
+    fn disasm_keyword(self) -> &'static str {
+        match self {
+            Stage::Vertex => "OpEntryPoint Vertex ",
+            Stage::Fragment => "OpEntryPoint Fragment ",
+        }
+    }
+}
+
 /// How a compiled module is displayed.
 pub enum RenderMode {
-    /// Classic vertex + fragment pair rendered through the render pass.
+    /// Classic vertex + fragment rendering through the render pass. The
+    /// stages may come from one module or from separate per-stage binaries.
     Graphics {
+        vertex_spirv: Vec<u32>,
+        fragment_spirv: Vec<u32>,
         vertex_entry: String,
         fragment_entry: String,
     },
     /// Compute kernel writing pixels through the playground's `drawPixel`.
     Compute {
+        spirv: Vec<u32>,
         entry: String,
         group_size: [u32; 3],
         parameters: Vec<ShaderParam>,
@@ -76,7 +124,6 @@ pub enum ParamKind {
 }
 
 pub struct CompiledShader {
-    pub spirv: Vec<u32>,
     pub mode: RenderMode,
 }
 
@@ -91,11 +138,36 @@ pub fn create_workdir() -> PathBuf {
     dir
 }
 
-/// Resolves the shader to view: first command-line argument, else stdin
-/// when it is piped (e.g. `viewer < demo.slang`), else usage instructions.
-pub fn resolve_source(workdir: &Path) -> SourceFile {
-    if let Some(arg) = env::args().nth(1) {
-        let path = PathBuf::from(&arg);
+/// Resolves what to view: a `.vert` + `.frag` pair when both are named on
+/// the command line, else the first argument as one `.slang` module, else
+/// stdin when it is piped (e.g. `viewer < demo.slang`), else usage.
+pub fn resolve_input(workdir: &Path) -> ShaderInput {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    if args.len() >= 2 {
+        let mut vertex = None;
+
+        let mut fragment = None;
+
+        for arg in &args {
+            match classify_stage(Path::new(arg)) {
+                Some((Stage::Vertex, _)) => vertex = Some(PathBuf::from(arg)),
+                Some((Stage::Fragment, _)) => fragment = Some(PathBuf::from(arg)),
+                None => {}
+            }
+        }
+
+        if let (Some(vertex), Some(fragment)) = (vertex, fragment) {
+            return ShaderInput::StagePair(StagePair {
+                display_name: format!("{} + {}", file_name(&vertex), file_name(&fragment)),
+                vertex,
+                fragment,
+            });
+        }
+    }
+
+    if let Some(arg) = args.first() {
+        let path = PathBuf::from(arg);
 
         if !path.is_file() {
             eprintln!("error: no such file: {arg}");
@@ -103,12 +175,10 @@ pub fn resolve_source(workdir: &Path) -> SourceFile {
             std::process::exit(2);
         }
 
-        let display_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| arg.clone());
-
-        return SourceFile { display_name, path };
+        return ShaderInput::Module(SourceFile {
+            display_name: file_name(&path),
+            path,
+        });
     }
 
     if !std::io::stdin().is_terminal() {
@@ -128,22 +198,329 @@ pub fn resolve_source(workdir: &Path) -> SourceFile {
 
         fs::write(&path, source).expect("write stdin shader to temp file");
 
-        return SourceFile {
+        return ShaderInput::Module(SourceFile {
             display_name: "stdin".to_string(),
             path,
-        };
+        });
     }
 
     eprintln!("usage: slang_files_viewer_shaders <path/to/shader.slang>");
+    eprintln!("       slang_files_viewer_shaders <vertex.vert> <fragment.frag>");
     eprintln!("       cat shader.slang | slang_files_viewer_shaders");
 
     std::process::exit(2);
 }
 
-/// Compiles the source module and picks a display mode from reflection.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Classifies a pair member's stage and file format.
+///
+/// Extensions decide when they can (.vert/.vs, .frag/.fs); otherwise the
+/// content is sniffed, so `.spv` binaries and misnamed `spirv-dis` dumps
+/// still form valid pairs.
+fn classify_stage(path: &Path) -> Option<(Stage, StageFormat)> {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+
+    let from_ext = match ext.as_deref() {
+        Some("vert" | "vs") => Some(Stage::Vertex),
+        Some("frag" | "fs") => Some(Stage::Fragment),
+        _ => None,
+    };
+
+    let bytes = fs::read(path).ok()?;
+
+    if bytes.starts_with(b"; SPIR-V") {
+        let text = String::from_utf8_lossy(&bytes);
+
+        let stage = from_ext.or_else(|| disasm_stage(&text))?;
+
+        Some((stage, StageFormat::Disassembly))
+    } else if bytes.starts_with(&SPIRV_MAGIC_LE) {
+        let stage = from_ext.or_else(|| binary_stage(&bytes))?;
+
+        Some((stage, StageFormat::Binary))
+    } else {
+        from_ext.map(|stage| (stage, StageFormat::Source))
+    }
+}
+
+const SPIRV_MAGIC_LE: [u8; 4] = 0x0723_0203u32.to_le_bytes();
+
+/// Stage of a disassembled module, from its OpEntryPoint keyword.
+fn disasm_stage(disasm: &str) -> Option<Stage> {
+    if disasm.contains("OpEntryPoint Vertex ") {
+        Some(Stage::Vertex)
+    } else if disasm.contains("OpEntryPoint Fragment ") {
+        Some(Stage::Fragment)
+    } else {
+        None
+    }
+}
+
+/// Stage of a raw SPIR-V binary, from the execution model of its first
+/// OpEntryPoint instruction (Vertex = 0, Fragment = 4).
+fn binary_stage(bytes: &[u8]) -> Option<Stage> {
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect();
+
+    let mut offset = 5;
+
+    while offset < words.len() {
+        let word_count = (words[offset] >> 16) as usize;
+
+        if word_count == 0 {
+            return None;
+        }
+
+        if words[offset] & 0xFFFF == 15 && offset + 2 < words.len() {
+            match words[offset + 1] {
+                0 => return Some(Stage::Vertex),
+                4 => return Some(Stage::Fragment),
+                _ => {}
+            }
+        }
+
+        offset += word_count;
+    }
+
+    None
+}
+
+/// The three forms a per-stage file can take.
+enum StageFormat {
+    /// `spirv-dis` text output; assembled back to binary with `spirv-as`.
+    Disassembly,
+    /// Raw SPIR-V binary; loaded directly.
+    Binary,
+    /// Slang/GLSL source compiled by slangc for one stage.
+    Source,
+}
+
+/// The name shown in the window title for the resolved input.
+pub fn display_name(input: &ShaderInput) -> String {
+    match input {
+        ShaderInput::Module(source) => source.display_name.clone(),
+        ShaderInput::StagePair(pair) => pair.display_name.clone(),
+    }
+}
+
+/// Compiles whatever was resolved from the command line / stdin.
 ///
 /// Exits the process with diagnostics on any user-facing failure.
-pub fn compile(workdir: &Path, source: &SourceFile) -> CompiledShader {
+pub fn compile(workdir: &Path, input: ShaderInput) -> CompiledShader {
+    match input {
+        ShaderInput::Module(source) => compile_module(workdir, &source),
+        ShaderInput::StagePair(pair) => compile_pair(&pair),
+    }
+}
+
+/// Builds a `.vert`/`.frag` pair stage by stage into separate SPIR-V binaries.
+fn compile_pair(pair: &StagePair) -> CompiledShader {
+    let vertex = build_stage(pair.vertex.as_path(), Stage::Vertex);
+
+    let fragment = build_stage(pair.fragment.as_path(), Stage::Fragment);
+
+    CompiledShader {
+        mode: RenderMode::Graphics {
+            vertex_spirv: vertex.spirv,
+            fragment_spirv: fragment.spirv,
+            vertex_entry: vertex.entry,
+            fragment_entry: fragment.entry,
+        },
+    }
+}
+
+/// One compiled graphics stage: its SPIR-V and entry-point name.
+struct BuiltStage {
+    spirv: Vec<u32>,
+    entry: String,
+}
+
+fn build_stage(path: &Path, stage: Stage) -> BuiltStage {
+    let (_, format) = match classify_stage(path) {
+        Some(classified) => classified,
+        None => {
+            eprintln!(
+                "error: cannot tell the stage of {}; expected .vert/.vs or .frag/.fs",
+                path.display()
+            );
+
+            std::process::exit(2);
+        }
+    };
+
+    match format {
+        StageFormat::Binary => {
+            let words = read_spirv(path);
+
+            // Raw binaries carry no readable name; slangc defaults to
+            // "main" unless -fvk-use-entrypoint-name was used at build time.
+            BuiltStage {
+                spirv: words,
+                entry: "main".to_string(),
+            }
+        }
+
+        StageFormat::Disassembly => {
+            let text = fs::read_to_string(path).unwrap_or_else(|err| {
+                eprintln!("error: cannot read {}: {err}", path.display());
+
+                std::process::exit(1);
+            });
+
+            let entry = parse_disasm_entry_point(&text, stage).unwrap_or_else(|| "main".into());
+
+            let spirv = assemble_disassembly(path);
+
+            BuiltStage { spirv, entry }
+        }
+
+        StageFormat::Source => compile_stage_source(path, stage),
+    }
+}
+
+/// Assembles `spirv-dis` text back to a SPIR-V binary.
+///
+/// Vulkan 1.1 accepts SPIR-V up to 1.3, so the target environment is pinned;
+/// if the module needs something newer the assembler is retried unversioned.
+fn assemble_disassembly(path: &Path) -> Vec<u32> {
+    let workdir = create_workdir();
+
+    let out = workdir.join("stage.spv");
+
+    let pinned = Command::new("spirv-as")
+        .arg(path)
+        .arg("-o")
+        .arg(&out)
+        .arg("--target-env")
+        .arg("vulkan1.1")
+        .output();
+
+    let output = match pinned {
+        Ok(output) if !output.status.success() => Command::new("spirv-as")
+            .arg(path)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("run spirv-as"),
+        Ok(output) => output,
+        Err(_) => {
+            eprintln!("error: spirv-as not found on PATH");
+
+            eprintln!("       it ships with the Vulkan SDK (x86_64/bin/spirv-as)");
+
+            std::process::exit(1);
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("error: spirv-as failed to assemble {}:", file_name(path));
+
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+
+        std::process::exit(1);
+    }
+
+    read_spirv(&out)
+}
+
+/// Compiles one stage of shader source with slangc.
+fn compile_stage_source(path: &Path, stage: Stage) -> BuiltStage {
+    let workdir = create_workdir();
+
+    let spirv_out = workdir.join("stage.spv");
+
+    let reflection_path = workdir.join("reflection.json");
+
+    let output = Command::new("slangc")
+        .arg(path)
+        .arg("-stage")
+        .arg(stage.slang_flag())
+        .arg("-target")
+        .arg("spirv")
+        .arg("-profile")
+        .arg("spirv_1_3")
+        .arg("-fvk-use-entrypoint-name")
+        .arg("-reflection-json")
+        .arg(&reflection_path)
+        .arg("-o")
+        .arg(&spirv_out)
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(_) => {
+            eprintln!("error: slangc not found on PATH");
+
+            eprintln!("       it ships with the Vulkan SDK (x86_64/bin/slangc)");
+
+            std::process::exit(1);
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!(
+            "error: slangc failed to compile {} as {}:",
+            file_name(path),
+            stage.slang_flag()
+        );
+
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+
+        std::process::exit(1);
+    }
+
+    // The emitted entry point name comes from reflection; source without
+    // [shader(...)] attributes that slang resolved still names it there.
+    let entry = fs::read_to_string(&reflection_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|reflection| {
+            reflection["entryPoints"]
+                .as_array()
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|entry| entry["stage"].as_str() == Some(stage.slang_flag()))
+                })
+                .and_then(|entry| entry["name"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "main".to_string());
+
+    BuiltStage {
+        spirv: read_spirv(&spirv_out),
+        entry,
+    }
+}
+
+/// Extracts the user-visible entry point name from a disassembled module:
+/// the quoted string on the `OpEntryPoint <Stage> %symbol "<name>"` line.
+fn parse_disasm_entry_point(disasm: &str, stage: Stage) -> Option<String> {
+    let line = disasm
+        .lines()
+        .find(|line| line.contains(stage.disasm_keyword()))?;
+
+    let open = line.find('"')? + 1;
+
+    let close = line[open..].find('"')? + open;
+
+    Some(line[open..close].to_string())
+}
+
+/// Compiles one .slang module and picks a display mode from reflection.
+///
+/// Exits the process with diagnostics on any user-facing failure.
+fn compile_module(workdir: &Path, source: &SourceFile) -> CompiledShader {
     let spirv_path = workdir.join("shader.spv");
 
     let reflection_path = workdir.join("reflection.json");
@@ -170,8 +547,9 @@ pub fn compile(workdir: &Path, source: &SourceFile) -> CompiledShader {
     fs::write(scaffold_dir.join("rendering.slang"), RENDERING_PRELUDE)
         .expect("write rendering prelude");
 
-    let scaffold_source =
-        with_playground_imports(&fs::read_to_string(&source.path).expect("read shader source"));
+    let scaffold_source = with_playground_imports(&String::from_utf8_lossy(
+        &fs::read(&source.path).expect("read shader source"),
+    ));
 
     let scaffold_path = workdir.join("with-prelude.slang");
 
@@ -311,8 +689,9 @@ fn finish(spirv_path: &Path, reflection_path: &Path) -> Option<CompiledShader> {
         && parameters.is_empty()
     {
         return Some(CompiledShader {
-            spirv: words,
             mode: RenderMode::Graphics {
+                vertex_spirv: words.clone(),
+                fragment_spirv: words,
                 vertex_entry: vertex_entry.clone(),
                 fragment_entry: fragment_entry.clone(),
             },
@@ -327,8 +706,8 @@ fn finish(spirv_path: &Path, reflection_path: &Path) -> Option<CompiledShader> {
         ];
 
         return Some(CompiledShader {
-            spirv: words,
             mode: RenderMode::Compute {
+                spirv: words,
                 entry,
                 group_size,
                 parameters,

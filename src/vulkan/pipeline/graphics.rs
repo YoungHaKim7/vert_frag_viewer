@@ -21,7 +21,8 @@ impl Graphics {
     pub(in crate::vulkan::pipeline) unsafe fn new(
         context: &DeviceBundle,
         swapchain: &SwapchainBundle,
-        shader_module: vk::ShaderModule,
+        vertex_module: vk::ShaderModule,
+        fragment_module: vk::ShaderModule,
         vertex_entry: &str,
         fragment_entry: &str,
     ) -> Self {
@@ -89,24 +90,26 @@ impl Graphics {
             // Shader Modules: Slang -> SPIR-V -> Vulkan
             // ------------------------------------------------------------
             //
-            // The Slang compiler produces SPIR-V binaries during the build.
-            // Vulkan consumes SPIR-V through VkShaderModule objects. The
-            // shader modules are only needed while creating the pipeline, so
-            // they can be destroyed immediately after pipeline creation.
+            // The vertex and fragment stages arrive as separate SPIR-V
+            // binaries (one module each, or the same module twice when a
+            // single .slang file supplied both entry points). Vulkan
+            // consumes SPIR-V through VkShaderModule objects. The shader
+            // modules are only needed while creating the pipeline, so they
+            // can be destroyed immediately after pipeline creation.
             //
 
             let vertex_name = CString::new(vertex_entry).unwrap();
 
             let vertex_stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(shader_module)
+                .module(vertex_module)
                 .name(&vertex_name);
 
             let fragment_name = CString::new(fragment_entry).unwrap();
 
             let fragment_stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(shader_module)
+                .module(fragment_module)
                 .name(&fragment_name);
 
             let stages = [vertex_stage, fragment_stage];

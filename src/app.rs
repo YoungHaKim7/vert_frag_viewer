@@ -24,9 +24,11 @@ pub(crate) const HEIGHT: u32 = 600;
 pub fn run() {
     let workdir = shader::create_workdir();
 
-    let source = shader::resolve_source(&workdir);
+    let input = shader::resolve_input(&workdir);
 
-    let compiled = shader::compile(&workdir, &source);
+    let title = shader::display_name(&input);
+
+    let compiled = shader::compile(&workdir, input);
 
     // The viewer can only supply random buffers and the output texture;
     // reject anything else before any window or device exists.
@@ -46,7 +48,7 @@ pub fn run() {
 
     let event_loop = EventLoop::new().expect("event loop");
 
-    let mut app = app::App::new(source.display_name.clone(), compiled);
+    let mut app = app::App::new(title, compiled);
 
     let result = event_loop.run_app(&mut app);
 

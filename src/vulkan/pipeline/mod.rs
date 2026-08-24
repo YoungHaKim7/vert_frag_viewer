@@ -15,37 +15,65 @@ pub(crate) enum Pipeline {
 }
 
 impl Pipeline {
+    /// Creates the shader modules the mode needs and builds the matching
+    /// pipeline from them. Modules are only used by pipeline creation, so
+    /// they are destroyed before returning.
     pub(crate) unsafe fn new(
         context: &DeviceBundle,
         swapchain: &SwapchainBundle,
-        shader_module: vk::ShaderModule,
         mode: &RenderMode,
     ) -> Self {
         unsafe {
+            let device = &context.device;
+
             match mode {
                 RenderMode::Graphics {
+                    vertex_spirv,
+                    fragment_spirv,
                     vertex_entry,
                     fragment_entry,
-                } => Self::Graphics(graphics::Graphics::new(
-                    context,
-                    swapchain,
-                    shader_module,
-                    vertex_entry,
-                    fragment_entry,
-                )),
+                } => {
+                    let vertex_module = create_shader_module(device, vertex_spirv);
+
+                    let fragment_module = create_shader_module(device, fragment_spirv);
+
+                    let graphics = graphics::Graphics::new(
+                        context,
+                        swapchain,
+                        vertex_module,
+                        fragment_module,
+                        vertex_entry,
+                        fragment_entry,
+                    );
+
+                    device.destroy_shader_module(vertex_module, None);
+
+                    device.destroy_shader_module(fragment_module, None);
+
+                    Self::Graphics(graphics)
+                }
 
                 RenderMode::Compute {
+                    spirv,
                     entry,
                     group_size,
                     parameters,
-                } => Self::Compute(compute::Compute::new(
-                    context,
-                    swapchain,
-                    shader_module,
-                    entry,
-                    group_size,
-                    parameters,
-                )),
+                } => {
+                    let shader_module = create_shader_module(device, spirv);
+
+                    let compute = compute::Compute::new(
+                        context,
+                        swapchain,
+                        shader_module,
+                        entry,
+                        group_size,
+                        parameters,
+                    );
+
+                    device.destroy_shader_module(shader_module, None);
+
+                    Self::Compute(compute)
+                }
             }
         }
     }
@@ -98,5 +126,15 @@ impl Pipeline {
             Self::Graphics(_) => vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             Self::Compute(_) => vk::PipelineStageFlags::TRANSFER,
         }
+    }
+}
+
+fn create_shader_module(device: &Device, spirv: &[u32]) -> vk::ShaderModule {
+    let module_info = vk::ShaderModuleCreateInfo::default().code(spirv);
+
+    unsafe {
+        device
+            .create_shader_module(&module_info, None)
+            .expect("shader module")
     }
 }
