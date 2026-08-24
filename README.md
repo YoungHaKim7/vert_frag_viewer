@@ -1,4 +1,5 @@
-<h1 align="center">`vert` & `frag` shader viewer</h1>
+# `vert` & `frag` shader viewer
+
 <br />
 
 <div align="center">
