@@ -7,7 +7,7 @@ description = "A viewer using frag and vert."
 license = "MIT"
 repository = "https://github.com/YoungHaKim7/vert_frag_viewer"
 documentation = "https://docs.rs/vert_frag_viewer"
-keywords = ["vulkan", "slang", "viewer", "shader", "vertex", "fragment"]
+keywords = ["vulkan", "viewer", "shader", "vertex", "fragment"]
 categories = ["development-tools", "graphics", "multimedia::images"]
 
 
