@@ -1,16 +1,27 @@
 //! # Rust + Slang + Vulkan — Documentation Guide
 //! - [https://vulkan-tutorial.com/](https://vulkan-tutorial.com/)
-//! ## 1. What this program demonstrates
+//! ## 1. What this program is
 //!
-//! This program is a minimal Vulkan renderer written in Rust using:
+//! `vert_frag_viewer` is a small Vulkan viewer for Slang shaders. Given a
+//! `.slang` module (a path on the command line, or piped through stdin) or a
+//! `.vert` + `.frag` pair, it compiles the shader at startup, decides from
+//! reflection how to display it, and renders it into a winit window.
+//!
+//! It is built from:
 //!
 //! - **winit** — creates the native application window and drives the event loop.
 //! - **ash** — Rust bindings for the Vulkan API.
 //! - **ash-window** — connects the winit window/display handles to a Vulkan surface.
-//! - **Slang** — compiles the vertex and fragment shaders.
+//! - **slangc** — the Slang compiler, run as an external tool at startup from
+//!   `PATH` (it ships with the Vulkan SDK). Slang is *not* a Rust dependency.
+//! - **spirv-as** — reassembles `spirv-dis` text dumps back into SPIR-V binaries.
 //! - **SPIR-V** — the shader intermediate representation consumed by Vulkan.
 //!
-//! The final rendering path is:
+//! There is no `build.rs`. Compilation happens once, in `shader::compile`,
+//! before any window or Vulkan object exists; the resulting SPIR-V words and
+//! entry-point names are all the renderer ever sees.
+//!
+//! The graphics rendering path is:
 //!
 //! ```text
 //! winit Window
@@ -47,7 +58,56 @@
 //! Presentation
 //! ```
 //!
-//! ## 2. The Vulkan object model
+//! ## 2. How the viewer decides what to display
+//!
+//! `shader::resolve_input` classifies the command line:
+//!
+//! - two or more arguments whose extensions (or contents) identify a vertex
+//!   and a fragment stage form a `.vert` + `.frag` pair;
+//! - a single argument is one `.slang` module (it must be an existing file);
+//! - with no arguments and stdin piped (e.g. `viewer < demo.slang`), the
+//!   source is dumped to a temp file and treated as one module, because
+//!   slangc only reads files;
+//! - anything else prints usage and exits.
+//!
+//! `shader::compile` then produces a `CompiledShader`, and its `RenderMode`
+//! selects everything the Vulkan side builds:
+//!
+//! ```text
+//! command line / stdin
+//!         │
+//!         ▼
+//! resolve_input()      one .slang module, or a .vert + .frag pair
+//!         │
+//!         ▼
+//! compile()            slangc / spirv-as / raw .spv -> SPIR-V + reflection JSON
+//!         │
+//!         ▼
+//! reflection           which entry points and parameters exist?
+//!         │
+//!         ├── vertex + fragment, no resource parameters ──► Graphics pipeline
+//!         └── compute entry point ──────────────────────► Compute + blit
+//! ```
+//!
+//! Two rules shape the supported inputs:
+//!
+//! - **Graphics** requires a vertex and a fragment entry point *and* zero
+//!   resource parameters — the viewer supplies no vertex data, buffers or
+//!   textures, so the module must be self-contained (an `SV_VertexID`
+//!   triangle, a fullscreen procedural shader, ...).
+//! - **Compute** follows the Slang Playground conventions: the kernel writes
+//!   pixels through `drawPixel`, and its parameters may only be an
+//!   `RWStructuredBuffer<float>` (which the viewer fills with random floats)
+//!   and the screen-sized output texture. Anything else is rejected before a
+//!   window opens.
+//!
+//! Playground demos rely on a prelude the web playground injects
+//! (`drawPixel`, `outputTexture`, the `[playground::...]` attributes). When a
+//! file does not compile on its own, the vendored prelude from
+//! `assets/playground/` is written to a scratch directory, the imports are
+//! prepended, and the compile is retried — so playground demos run unchanged.
+//!
+//! ## 3. The Vulkan object model
 //!
 //! A useful way to understand Vulkan is to separate **creation/discovery objects** from
 //! **GPU execution resources**.
@@ -58,7 +118,7 @@
 //!
 //! In this program:
 //!
-//! ```rust
+//! ```rust,ignore
 //! let entry = Entry::load().expect("failed to load Vulkan");
 //!
 //! let instance = entry
@@ -73,7 +133,7 @@
 //!
 //! A physical device represents an actual GPU.
 //!
-//! ```rust
+//! ```rust,ignore
 //! let physical_devices = instance
 //!     .enumerate_physical_devices()
 //!     .expect("failed to enumerate physical devices");
@@ -94,7 +154,7 @@
 //!
 //! The logical device is the application's interface to the selected physical GPU.
 //!
-//! ```rust
+//! ```rust,ignore
 //! let device = instance
 //!     .create_device(physical_device, &device_create_info, None)
 //!     .expect("failed to create logical device");
@@ -103,9 +163,10 @@
 //! A `VkDevice` owns access to device-level resources such as:
 //!
 //! - queues
+//! - images, buffers and device memory
 //! - image views
 //! - render passes
-//! - pipelines
+//! - pipelines and descriptor sets
 //! - command pools
 //! - semaphores
 //! - fences
@@ -115,36 +176,50 @@
 //!
 //! A queue is where recorded GPU work is submitted.
 //!
-//! ```rust
+//! ```rust,ignore
 //! let queue = device.get_device_queue(queue_family_index, 0);
 //! ```
 //!
 //! The program later performs:
 //!
-//! ```rust
+//! ```rust,ignore
 //! device.queue_submit(queue, ...);
 //! ```
 //!
 //! and:
 //!
-//! ```rust
+//! ```rust,ignore
 //! swapchain_loader.queue_present(queue, ...);
 //! ```
 //!
-//! ## 3. Surface and swapchain
+//! ## 4. Surface and swapchain
 //!
 //! A Vulkan surface represents the application's window as a presentation target.
 //!
 //! The surface itself does not contain the rendered pixels. Instead, the swapchain
 //! provides a set of images that can be rendered to and presented.
 //!
-//! The program creates it with:
-//!
-//! ```rust
+//! ```rust,ignore
 //! let swapchain = swapchain_loader
-//! .create_swapchain(&swapchain_create_info, None)
-//! .expect("failed to create swapchain");
+//!     .create_swapchain(&swapchain_create_info, None)
+//!     .expect("failed to create swapchain");
 //! ```
+//!
+//! The configuration is chosen from the surface capabilities:
+//!
+//! - **format**: `B8G8R8A8_UNORM` when the surface offers it, otherwise the
+//!   first reported format;
+//! - **extent**: the surface's current extent, falling back to the window
+//!   size (800×600) when the window system does not fix one
+//!   (`current_extent.width == u32::MAX`);
+//! - **present mode**: `MAILBOX` when available, otherwise the mandatory `FIFO`;
+//! - **image count**: `min_image_count + 1`, clamped to `max_image_count`
+//!   when the surface enforces a maximum.
+//!
+//! The swapchain images are created with
+//! `COLOR_ATTACHMENT | TRANSFER_DST` usage: the graphics path renders into
+//! them through the render pass, and the compute path blits its offscreen
+//! result into them.
 //!
 //! Conceptually:
 //!
@@ -156,31 +231,29 @@
 //!    └── Image 2 ── ImageView 2 ── Framebuffer 2
 //! ```
 //!
-//! The exact number of images is selected from the surface capabilities.
-//!
 //! ### Why does `acquire_next_image()` return an index?
 //!
 //! Because Vulkan may give the application any currently available swapchain image:
 //!
-//! ```rust
+//! ```rust,ignore
 //! let (image_index, _) = swapchain_loader.acquire_next_image(...)?;
 //! ```
 //!
 //! The index is then used to select the matching framebuffer:
 //!
-//! ```rust
+//! ```rust,ignore
 //! self.framebuffers[image_index as usize]
 //! ```
 //!
 //! This is why the command buffer is recorded after acquiring the image.
 //!
-//! ## 4. Image vs. image view
+//! ## 5. Image vs. image view
 //!
 //! A Vulkan `Image` is the underlying GPU image resource.
 //!
 //! An `ImageView` describes how that image is accessed:
 //!
-//! ```rust
+//! ```rust,ignore
 //! let info = vk::ImageViewCreateInfo::default()
 //!     .image(image)
 //!     .view_type(vk::ImageViewType::TYPE_2D)
@@ -201,13 +274,13 @@
 //! VkFramebuffer
 //! ```
 //!
-//! ## 5. Render pass
+//! ## 6. Render pass
 //!
-//! This example has one color attachment.
+//! The graphics mode uses one color attachment.
 //!
 //! The important settings are:
 //!
-//! ```rust
+//! ```rust,ignore
 //! .load_op(vk::AttachmentLoadOp::CLEAR)
 //! .store_op(vk::AttachmentStoreOp::STORE)
 //! .initial_layout(vk::ImageLayout::UNDEFINED)
@@ -227,33 +300,72 @@
 //!
 //! The render pass also contains a subpass:
 //!
-//! ```rust
+//! ```rust,ignore
 //! .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
 //! .color_attachments(&color_refs)
 //! ```
 //!
 //! A subpass describes how the graphics pipeline uses the attachment.
+//! The compute mode skips the render pass entirely; it manages layouts with
+//! explicit barriers instead (see section 11).
 //!
-//! ## 6. Shaders and SPIR-V
+//! ## 7. Shaders: compiled at startup, not build time
 //!
-//! The shaders are compiled by Slang before the Rust program runs.
+//! All shader compilation happens when the program starts, by running the
+//! external `slangc` (and, for disassembled inputs, `spirv-as`) from `PATH`.
+//! Nothing is embedded with `include_bytes!` and there is no `build.rs`.
 //!
-//! The Rust program includes the resulting binaries:
+//! ### One `.slang` module
 //!
-//! ```rust
-//! let vertex_code =
-//!     include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv"));
-//!     
-//! let fragment_code =
-//!     include_bytes!(concat!(env!("OUT_DIR"), "/triangle.frag.spv"));
-//! ```
-//!
-//! The flow is:
+//! A single `slangc` invocation compiles the whole file — no `-entry` flag,
+//! so every entry point lands in one SPIR-V module — and reflection JSON is
+//! requested alongside:
 //!
 //! ```text
-//! Slang source
+//! slangc demo.slang -target spirv -profile spirv_1_3 \
+//!          -fvk-use-entrypoint-name -reflection-json reflection.json -o shader.spv
+//! ```
+//!
+//! - `-profile spirv_1_3` — SPIR-V 1.3 is the newest version Vulkan 1.1 accepts;
+//! - `-fvk-use-entrypoint-name` — keeps `vertMain`/`fragMain`/`imageMain`
+//!   instead of renaming every entry point to `"main"`;
+//! - the reflection JSON is what section 2's display-mode decision reads.
+//!
+//! If the plain compile fails or yields nothing displayable, the same
+//! invocation is retried with the vendored playground prelude: the imports
+//! `import playground;` / `import rendering;` are prepended (unless the
+//! source already imports them) and the prelude directory is passed with
+//! `-I`. When both attempts fail, the diagnostics of the *plain* attempt are
+//! shown, because they describe the user's actual file.
+//!
+//! ### A `.vert` + `.frag` pair
+//!
+//! Each stage is built on its own. `classify_stage` sniffs the file contents
+//! to accept three formats per stage:
+//!
+//! ```text
+//! starts with "; SPIR-V"                ──► spirv-dis text
+//! starts with the SPIR-V magic bytes    ──► raw binary
+//! anything else                         ──► Slang/GLSL source
+//! ```
+//!
+//! | Format | How it is built | Entry-point name |
+//! |---|---|---|
+//! | source (`.vert`/`.vs`, `.frag`/`.fs`) | `slangc -stage vertex\|fragment` | from the reflection JSON, else `"main"` |
+//! | `spirv-dis` text | `spirv-as --target-env vulkan1.1` (retried unversioned if the module needs newer SPIR-V) | the quoted name on the `OpEntryPoint` line, else `"main"` |
+//! | raw SPIR-V binary | loaded as-is | `"main"` (slangc's default without `-fvk-use-entrypoint-name`) |
+//!
+//! The stage itself comes from the extension; when the extension does not say
+//! (a misnamed dump or binary), it is recovered from the module — the
+//! `OpEntryPoint Vertex/Fragment` keyword in disassembly, or the execution
+//! model of the first entry point in a binary (Vertex = 0, Fragment = 4).
+//!
+//! The flow for every input is:
+//!
+//! ```text
+//! .slang / .vert+.frag / .spv / disassembly
 //!     │
-//!     │ slangc
+//!     │ slangc / spirv-as / (nothing)
 //!     ▼
 //! SPIR-V
 //!     │
@@ -261,23 +373,21 @@
 //! VkShaderModule
 //!     │
 //!     ▼
-//! Graphics Pipeline
+//! Graphics / Compute Pipeline
 //! ```
 //!
 //! A shader module contains the compiled shader code. It is needed to create the
-//! pipeline, but this program does not need to retain the modules afterward:
+//! pipeline, but the viewer destroys the modules immediately after pipeline
+//! creation, since nothing else references them:
 //!
-//! ```rust
+//! ```rust,ignore
 //! device.destroy_shader_module(vertex_module, None);
 //! device.destroy_shader_module(fragment_module, None);
 //! ```
 //!
-//! The resulting `graphics_pipeline` contains the pipeline state needed for later
-//! execution.
+//! ## 8. Why there is no vertex buffer
 //!
-//! ## 7. Why there is no vertex buffer
-//!
-//! This is one of the most educational parts of the example.
+//! This is one of the most educational parts of the graphics mode.
 //!
 //! Normally a Vulkan application might do:
 //!
@@ -297,7 +407,7 @@
 //!
 //! The Rust side simply submits:
 //!
-//! ```rust
+//! ```rust,ignore
 //! device.cmd_draw(command_buffer, 3, 1, 0, 0);
 //! ```
 //!
@@ -316,16 +426,17 @@
 //! ```text
 //! CPU:
 //!     vkCmdDraw(..., vertexCount = 3, ...)
-//!     
+//!
 //! GPU:
 //!     vertex ID 0 -> triangle vertex 0
 //!     vertex ID 1 -> triangle vertex 1
 //!     vertex ID 2 -> triangle vertex 2
 //! ```
 //!
-//! No vertex buffer is required.
+//! No vertex buffer is required — which is exactly why the viewer can display
+//! any self-contained `.slang` module without knowing its vertex layout.
 //!
-//! ## 8. Graphics pipeline
+//! ## 9. Graphics pipeline
 //!
 //! The graphics pipeline combines many fixed rendering decisions.
 //!
@@ -333,7 +444,7 @@
 //!
 //! ### Vertex input
 //!
-//! ```rust
+//! ```rust,ignore
 //! let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
 //! ```
 //!
@@ -341,7 +452,7 @@
 //!
 //! ### Primitive assembly
 //!
-//! ```rust
+//! ```rust,ignore
 //! .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
 //! ```
 //!
@@ -349,7 +460,7 @@
 //!
 //! ### Viewport
 //!
-//! ```rust
+//! ```rust,ignore
 //! let viewport = vk::Viewport {
 //!     x: 0.0,
 //!     y: 0.0,
@@ -364,7 +475,7 @@
 //!
 //! ### Rasterization
 //!
-//! ```rust
+//! ```rust,ignore
 //! .polygon_mode(vk::PolygonMode::FILL)
 //! .cull_mode(vk::CullModeFlags::NONE)
 //! ```
@@ -373,7 +484,7 @@
 //!
 //! ### Multisampling
 //!
-//! ```rust
+//! ```rust,ignore
 //! .rasterization_samples(vk::SampleCountFlags::TYPE_1)
 //! ```
 //!
@@ -381,39 +492,96 @@
 //!
 //! ### Color blending
 //!
-//! ```rust
+//! ```rust,ignore
 //! .blend_enable(false)
 //! ```
 //!
 //! The fragment color is written directly rather than alpha-blended with the
 //! existing framebuffer color.
 //!
-//! ## 9. Command buffers
+//! ## 10. Command buffers
 //!
 //! Vulkan separates command recording from command execution.
+//!
+//! The viewer allocates one primary command buffer from a pool created with
+//! `RESET_COMMAND_BUFFER`, so the same buffer can be reset and re-recorded
+//! every frame.
 //!
 //! The program records:
 //!
 //! ```txt
 //! begin command buffer
 //!     │
-//!     ├── begin render pass
-//!     ├── bind graphics pipeline
-//!     ├── draw 3 vertices
-//!     └── end render pass
+//!     ├── begin render pass        (graphics mode)
+//!     ├── bind graphics pipeline   (graphics mode)
+//!     ├── draw 3 vertices          (graphics mode)
+//!     ├── end render pass          (graphics mode)
+//!     │
+//!     ├── barriers + dispatch      (compute mode)
+//!     ├── barriers + blit          (compute mode)
+//!     └── barrier to present       (compute mode)
 //! end command buffer
 //! ```
 //!
 //! Only later does the queue execute it:
 //!
-//! ```rust
+//! ```rust,ignore
 //! device.queue_submit(queue, &[submit_info], fence);
 //! ```
 //!
 //! This separation is one of Vulkan's major design characteristics. It allows
 //! applications to prepare GPU work explicitly and submit it efficiently.
 //!
-//! ## 10. Synchronization
+//! ## 11. The compute (playground) path
+//!
+//! A module with a compute entry point is displayed playground-style: the
+//! kernel fills an offscreen image, and the image is blitted into the
+//! acquired swapchain image. No render pass or framebuffer is involved.
+//!
+//! ### Resources created at startup
+//!
+//! - **Offscreen image** — `R8G8B8A8_UNORM`, sized to the swapchain extent,
+//!   device-local, used as `STORAGE | TRANSFER_SRC`. `rgba8` matches the
+//!   `[format("rgba8")]` on the playground's `outputTexture`; the blit
+//!   converts to the swapchain format if it differs.
+//! - **Random-float buffer** — when the kernel declares an
+//!   `RWStructuredBuffer<float>`, a storage buffer of `[playground::RAND(n)]`
+//!   elements (defaulting to 131 072) is allocated in host-visible,
+//!   host-coherent memory and filled once with uniform randoms from a
+//!   xorshift64* generator — the same way the playground fills its `RAND`
+//!   buffers.
+//! - **Descriptors** — one binding per reflection parameter, at the binding
+//!   index slangc assigned (`STORAGE_BUFFER` for the random buffer,
+//!   `STORAGE_IMAGE` for the output texture), collected into a single
+//!   descriptor set.
+//!
+//! ### The per-frame image lifecycle
+//!
+//! ```text
+//! offscreen:  UNDEFINED ──► GENERAL            (compute writes pixels)
+//!                     dispatch (one thread group per threadGroupSize tile)
+//! offscreen:  GENERAL ──► TRANSFER_SRC_OPTIMAL
+//! swapchain:  UNDEFINED ──► TRANSFER_DST_OPTIMAL
+//!                     vkCmdBlitImage (LINEAR; scales and converts format)
+//! swapchain:  TRANSFER_DST_OPTIMAL ──► PRESENT_SRC_KHR
+//! ```
+//!
+//! Each arrow is an explicit `vkCmdPipelineBarrier`; compute shaders write
+//! storage images in the `GENERAL` layout, and presentation requires
+//! `PRESENT_SRC_KHR`, so the layout must be walked both ways every frame.
+//!
+//! The dispatch covers the whole image:
+//!
+//! ```text
+//! group_count.x = ceil(extent.width  / threadGroupSize.x)
+//! group_count.y = ceil(extent.height / threadGroupSize.y)
+//! group_count.z = 1
+//! ```
+//!
+//! The core 1.0 `vkCmdBlitImage` is used rather than the `*2` variant,
+//! which would require Vulkan 1.3 or `KHR_copy_commands2`.
+//!
+//! ## 12. Synchronization
 //!
 //! Synchronization is essential in Vulkan because CPU and GPU operations are
 //! asynchronous.
@@ -422,7 +590,7 @@
 //!
 //! ### Semaphore 1: `image_available`
 //!
-//! ```rust
+//! ```rust,ignore
 //! image_available
 //! ```
 //!
@@ -430,38 +598,45 @@
 //!
 //! > The swapchain image acquired by the application is ready for rendering.
 //!
-//! The queue waits for this semaphore before the color-output stage.
+//! The queue waits for this semaphore before a mode-dependent stage — before
+//! the color-attachment output stage in graphics mode, before the transfer
+//! stage in compute mode (the image is only needed by the blit).
 //!
-//! ### Semaphore 2: `render_finished`
+//! ### Semaphores 2: `render_finished[image_index]`
 //!
-//! ```rust
-//! render_finished
-//! ```
+//! There is **one per swapchain image**, not a single one. A present
+//! operation's semaphore wait is not covered by the in-flight fence, so with
+//! a single semaphore a later frame could signal it again while an earlier
+//! present still waits on it. Indexing by the acquired image means each
+//! image has its own binary semaphore.
 //!
-//! It signals:
+//! Each signals:
 //!
-//! > Rendering of the submitted command buffer has completed.
+//! > Rendering into swapchain image `image_index` has completed.
 //!
-//! Presentation waits for this semaphore.
+//! Presentation of that image waits for it.
 //!
 //! ### Fence: `in_flight`
 //!
 //! The fence is different because the CPU waits on it:
 //!
-//! ```rust
-//! device.wait_for_fences(&[self.in_flight], true, u64::MAX);
+//! ```rust,ignore
+//! device.wait_for_fences(&[self.sync.in_flight], true, u64::MAX);
 //! ```
 //!
-//! It tells the CPU that the previous queue submission has finished.
+//! It tells the CPU that the previous queue submission has finished, so the
+//! single reusable command buffer is no longer in use. It is created in the
+//! signaled state (otherwise the very first frame would wait forever) and
+//! reset right before each submit.
 //!
 //! A useful mental model is:
 //!
 //! ```text
 //! CPU
 //!  │
-//!  │ wait fence
+//!  │ wait + reset fence
 //!  ▼
-//! Acquire image
+//! Acquire image ─── signals image_available
 //!  │
 //!  ▼
 //! Record commands
@@ -472,26 +647,26 @@
 //!  │ image_available         │
 //!  │────────────────────────►│
 //!  │                         ▼
-//!  │                    Render triangle
+//!  │                    Render / dispatch + blit
 //!  │                         │
-//!  │                         │ render_finished
+//!  │                         │ render_finished[image_index]
 //!  │                         ▼
 //!  │                    Presentation
 //!  │
-//!  └──── fence signals when submission is complete
+//!  └──── in_flight signals when the submission is complete
 //! ```
 //!
-//! ## 11. Why the command buffer is recorded every frame
+//! ## 13. Why the command buffer is recorded every frame
 //!
 //! The program has:
 //!
-//! ```rust
+//! ```rust,ignore
 //! let (image_index, _) = acquire_next_image(...);
 //! ```
 //!
 //! and then:
 //!
-//! ```rust
+//! ```rust,ignore
 //! self.record_command_buffer(image_index);
 //! ```
 //!
@@ -501,39 +676,44 @@
 //! framebuffer 1 or 2 would not automatically make the commands target that image.
 //!
 //! The example therefore records the command buffer using the framebuffer associated
-//! with the newly acquired image.
+//! with the newly acquired image. The command pool is created with
+//! `RESET_COMMAND_BUFFER` precisely to allow this reset-and-rerecord cycle with a
+//! single buffer.
 //!
-//! ## 12. Vulkan ownership and Rust ownership
+//! ## 14. Vulkan ownership and Rust ownership
 //! - [Ownership Concepts(C++ VS Rust), If you want to learn more, come to my blog.](https://younghakim7.github.io/blog/posts/unique_ptr_vs_shared_ptr_ownership/)
 //!   Vulkan itself uses explicit handle lifetime management.
 //!
 //! For example:
 //!
-//! ```rust
+//! ```rust,ignore
 //! let image_view = device.create_image_view(...);
 //! ```
 //!
 //! must eventually be paired with:
 //!
-//! ```rust
+//! ```rust,ignore
 //! device.destroy_image_view(image_view, None);
 //! ```
 //!
 //! Rust does not automatically know that a raw Vulkan handle needs that particular
 //! destructor.
 //!
-//! This program therefore makes `VulkanApp` the practical owner of the resources:
+//! The viewer groups its handles into bundles, one per concern, and makes
+//! `VulkanApp` the practical owner of them:
 //!
-//! ```rust
+//! ```rust,ignore
 //! struct VulkanApp {
-//!     instance: ash::Instance,
-//!     device: ash::Device,
-//!     swapchain: vk::SwapchainKHR,
-//!     ...
+//!     context: DeviceBundle,      // entry, instance, surface, device, queue
+//!     swapchain: SwapchainBundle, // swapchain, images, image views, format
+//!     pipeline: Pipeline,         // graphics or compute pipeline (+ resources)
+//!     commands: Commands,         // command pool + the single buffer
+//!     sync: SyncObjects,          // semaphores + fence
 //! }
 //! ```
 //!
-//! The `destroy()` method performs the cleanup.
+//! Each bundle exposes its own `destroy()`, and the top-level `destroy()`
+//! calls them in reverse creation order.
 //!
 //! This resembles RAII in C++:
 //!
@@ -551,38 +731,29 @@
 //! A production Rust Vulkan wrapper can instead implement `Drop` or use higher-level
 //! RAII-style abstractions so resource cleanup happens automatically.
 //!
-//! ## 13. Correct destruction order
+//! ## 15. Correct destruction order
 //!
 //! The destruction order is important because Vulkan objects have dependencies.
 //!
-//! The program roughly performs:
+//! After `device_wait_idle()`, the program performs:
 //!
 //! ```text
 //! wait for GPU
 //!     │
 //!     ▼
-//! semaphores / fence
+//! sync           semaphores, fence
 //!     │
 //!     ▼
-//! command pool
+//! commands       command pool (also frees its buffers)
 //!     │
 //!     ▼
-//! framebuffers
+//! pipeline       graphics: framebuffers, pipeline, pipeline layout, render pass
+//!                compute:  pipeline, pipeline layout, descriptor pool,
+//!                          descriptor set layout, image view, image, memory,
+//!                          random buffer + memory
 //!     │
 //!     ▼
-//! graphics pipeline
-//!     │
-//!     ▼
-//! pipeline layout
-//!     │
-//!     ▼
-//! render pass
-//!     │
-//!     ▼
-//! image views
-//!     │
-//!     ▼
-//! swapchain
+//! swapchain      image views, swapchain
 //!     │
 //!     ▼
 //! logical device
@@ -604,11 +775,11 @@
 //! Likewise, device-owned resources should be destroyed before destroying the
 //! logical device.
 //!
-//! ## 14. Why `device_wait_idle()` is used before destruction
+//! ## 16. Why `device_wait_idle()` is used before destruction
 //!
 //! The program starts destruction with:
 //!
-//! ```rust
+//! ```rust,ignore
 //! self.device.device_wait_idle().unwrap();
 //! ```
 //!
@@ -618,11 +789,11 @@
 //! Without an appropriate synchronization strategy, destroying an object while
 //! the GPU is still using it would be invalid.
 //!
-//! ## 15. Vulkan + Rust safety boundary
+//! ## 17. Vulkan + Rust safety boundary
 //!
 //! Most of the Vulkan operations in this example are inside:
 //!
-//! ```rust
+//! ```rust,ignore
 //! unsafe {
 //!     ...
 //! }
@@ -645,19 +816,18 @@
 //! Rust still provides valuable safety for ordinary program structure, references,
 //! ownership of the `VulkanApp`, and other CPU-side data.
 //!
-//! ## 16. `shaderDrawParameters`
+//! ## 18. `shaderDrawParameters`
 //!
-//! This example explicitly enables:
+//! The graphics path explicitly enables:
 //!
-//! ```rust
+//! ```rust,ignore
 //! .shader_draw_parameters(true);
 //! ```
 //!
-//! The reason is documented in the source: the Slang-generated SPIR-V declares a
-//! built-in associated with vertex drawing parameters, and the corresponding
-//! Vulkan capability requires the Vulkan 1.1 feature.
-//!
-//! The initialization therefore:
+//! The reason: slangc declares an (unused) `BuiltIn BaseVertex` input for
+//! `SV_VertexID`, which pulls in the `DrawParameters` SPIR-V capability, and
+//! that capability is only legal when the `shaderDrawParameters` device
+//! feature (Vulkan 1.1) is enabled. The initialization therefore:
 //!
 //! 1. requires Vulkan 1.1;
 //! 2. queries `PhysicalDeviceVulkan11Features`;
@@ -669,53 +839,56 @@
 //! > A shader capability is not necessarily available merely because the GPU
 //! > supports Vulkan. The required device feature must also be enabled.
 //!
-//! ## 17. Complete per-frame lifecycle
+//! ## 19. Complete per-frame lifecycle
 //!
 //! The whole frame can be reduced to:
 //!
 //! ```text
-//! wait for previous frame
+//! wait for previous frame (fence)
 //!         │
 //!         ▼
-//! acquire swapchain image
+//! acquire swapchain image ── signals image_available
 //!         │
 //!         ▼
 //! record command buffer
 //!         │
-//!         ├── begin render pass
-//!         ├── clear color
-//!         ├── bind pipeline
-//!         ├── draw 3 vertices
-//!         └── end render pass
+//!         ├── graphics: render pass, bind pipeline, draw 3 vertices
+//!         └── compute:  barriers, dispatch, barriers, blit
 //!         │
 //!         ▼
 //! submit to graphics queue
-//!         │
-//!         ▼
-//! wait for rendering semaphore
-//!         │
+//!         │           waits image_available, signals render_finished[i] + fence
 //!         ▼
 //! present swapchain image
+//!                     waits render_finished[i]
 //! ```
+//!
+//! winit drives this continuously: `about_to_wait` requests a redraw on every
+//! event-loop iteration, so the shader animates if it uses time-varying
+//! inputs, and the frame is otherwise re-rendered as fast as the present
+//! mode allows.
 //!
 //! That is the central Vulkan rendering loop represented by this program.
 //!
-//! ## 18. The most important concepts to learn next
+//! ## 20. The most important concepts to learn next
 //!
 //! After understanding this example, the next useful Vulkan topics are:
 //!
 //! 1. **Vulkan synchronization 2** — modern synchronization APIs.
-//! 2. **Image layouts and barriers** — how Vulkan controls image usage transitions.
-//! 3. **Descriptor sets** — passing buffers/textures/samplers to shaders.
+//! 2. **Image layouts and barriers** — how Vulkan controls image usage transitions
+//!    (the compute path already uses them explicitly).
+//! 3. **Descriptor sets** — passing buffers/textures/samplers to shaders (used
+//!    by the compute path).
 //! 4. **Uniform buffers** — passing matrices and other per-frame data.
 //! 5. **Vertex buffers** — replacing `SV_VertexID` with explicit vertex data.
 //! 6. **Depth buffers** — adding depth testing.
 //! 7. **Multiple frames in flight** — increasing CPU/GPU overlap.
-//! 8. **Swapchain recreation** — handling window resizing and `OUT_OF_DATE_KHR`.
+//! 8. **Swapchain recreation** — handling window resizing and `OUT_OF_DATE_KHR`
+//!    (the viewer currently creates a fixed, non-resizable window instead).
 //! 9. **Command buffer reuse** — reducing per-frame recording overhead.
 //! 10. **Vulkan validation layers** — catching incorrect API usage during development.
 //!
-//! ## 19. Suggested mental model
+//! ## 21. Suggested mental model
 //!
 //! When reading Vulkan code, ask these five questions:
 //!

@@ -16,7 +16,9 @@ use winit::window::Window;
 
 use crate::shader::CompiledShader;
 
-/// Owns the Vulkan objects required to render one triangle.
+/// Owns every Vulkan object the viewer creates: device context, swapchain,
+/// the mode-specific pipeline (graphics or compute), the reusable command
+/// buffer, and synchronization.
 ///
 /// # Vulkan object hierarchy
 ///
@@ -47,7 +49,7 @@ pub(crate) struct VulkanApp {
 }
 
 impl VulkanApp {
-    /// Creates all Vulkan state needed by the triangle renderer.
+    /// Creates all Vulkan state needed by the compiled shader's display mode.
     ///
     /// Vulkan exposes a relatively explicit initialization model. In broad
     /// terms this function performs these steps:

@@ -30,3 +30,20 @@ $ spirv-dis vert.spv -o triangle.vert
 
 ```
 
+# view with this crate
+
+The viewer accepts every artifact of the workflow above directly, plus the
+plain sources and raw binaries:
+
+```bash
+# spirv-dis text pair (as produced above)
+cargo r --release ./assets/triangle.vert ./assets/triangle.frag
+
+# or the raw SPIR-V binaries
+cargo r --release frag.spv vert.spv
+```
+
+Note: the commands above run slangc *without* `-fvk-use-entrypoint-name`, so
+the entry points are named `"main"` in the disassembly — the viewer reads the
+quoted name from the `OpEntryPoint` line and handles both cases.
+
