@@ -5,5 +5,5 @@
 /// and explicitly destroys Vulkan resources when the window closes.
 ///
 fn main() {
-    slang_files_viewer_shaders::run();
+    vert_frag_viewer::run();
 }
