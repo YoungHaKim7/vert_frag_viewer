@@ -6,6 +6,9 @@
 //!   `slangc` invocation, and inspected through the emitted reflection JSON
 //!   to decide how to display it (vertex + fragment -> graphics pipeline,
 //!   compute entry point -> playground-style compute pass);
+//! - a Shadertoy-style `.glsl` file (any text module defining `mainImage`):
+//!   wrapped with the Shadertoy built-in uniforms and a `main()` entry
+//!   point, and rendered as a fullscreen pass fed by push constants;
 //! - a `.vert` + `.frag` pair: each stage is built on its own. SPIR-V
 //!   disassembly (the output of `spirv-dis`, e.g. from the slangc workflow
 //!   in assets/README.md) is assembled with `spirv-as`; plain slang/GLSL
@@ -95,6 +98,11 @@ pub enum RenderMode {
         fragment_spirv: Vec<u32>,
         vertex_entry: String,
         fragment_entry: String,
+        /// Shadertoy mode: the fragment stage reads the Shadertoy
+        /// built-ins (`iTime`, `iResolution`, ...) from the push-constant
+        /// block the viewer's wrapper declares, and the viewer feeds that
+        /// block every frame.
+        shadertoy: bool,
     },
     /// Compute kernel writing pixels through the playground's `drawPixel`.
     Compute {
@@ -104,6 +112,40 @@ pub enum RenderMode {
         parameters: Vec<ShaderParam>,
     },
 }
+
+/// The per-frame values of the Shadertoy built-ins, laid out exactly like
+/// the std140 push-constant block the wrapper GLSL declares (field order
+/// must not drift from [`SHADERTOY_UNIFORM_BLOCK`]).
+///
+/// [`i_resolution`](Self::i_resolution) is filled in at draw time from the
+/// swapchain extent; the rest come from the frame clock in `app.rs`.
+#[repr(C)]
+pub struct ShadertoyUniforms {
+    pub i_resolution: [f32; 3],
+    pub i_time: f32,
+    pub i_mouse: [f32; 4],
+    pub i_date: [f32; 4],
+    pub i_time_delta: f32,
+    pub i_frame_rate: f32,
+    pub i_frame: i32,
+}
+
+impl ShadertoyUniforms {
+    /// The bytes to hand to `vkCmdPushConstants`. `repr(C)` with only
+    /// 4-byte-aligned fields produces exactly the std140 layout slangc
+    /// emits (offsets 0/12/16/32/48/52/56); the size assert below turns
+    /// any accidental layout change into a compile error.
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<ShadertoyUniforms>() == 60);
 
 /// A module-level shader parameter the viewer must bind.
 pub struct ShaderParam {
@@ -206,6 +248,7 @@ pub fn resolve_input(workdir: &Path) -> ShaderInput {
 
     eprintln!("usage: slang_files_viewer_shaders <path/to/shader.slang>");
     eprintln!("       slang_files_viewer_shaders <vertex.vert> <fragment.frag>");
+    eprintln!("       slang_files_viewer_shaders <shadertoy.glsl>  (mainImage-style GLSL)");
     eprintln!("       cat shader.slang | slang_files_viewer_shaders");
 
     std::process::exit(2);
@@ -337,6 +380,7 @@ fn compile_pair(pair: &StagePair) -> CompiledShader {
             fragment_spirv: fragment.spirv,
             vertex_entry: vertex.entry,
             fragment_entry: fragment.entry,
+            shadertoy: false,
         },
     }
 }
@@ -523,6 +567,10 @@ fn parse_disasm_entry_point(disasm: &str, stage: Stage) -> Option<String> {
 ///
 /// Exits the process with diagnostics on any user-facing failure.
 fn compile_module(workdir: &Path, source: &SourceFile) -> CompiledShader {
+    if is_shadertoy(&source.path) {
+        return compile_shadertoy(workdir, source);
+    }
+
     let spirv_path = workdir.join("shader.spv");
 
     let reflection_path = workdir.join("reflection.json");
@@ -641,6 +689,207 @@ fn with_playground_imports(source: &str) -> String {
     }
 }
 
+//
+// ------------------------------------------------------------
+// Shadertoy-style GLSL
+// ------------------------------------------------------------
+//
+// Shadertoy exports are fragment-only GLSL around a `mainImage(out, in)`
+// entry point, relying on uniforms (`iTime`, `iResolution`, ...) that
+// Shadertoy's own environment injects. The viewer wraps the export so
+// slangc accepts it, and feeds the uniforms as push constants.
+//
+
+/// True when the module is a Shadertoy-style export rather than a slangc
+/// module: text GLSL defining `mainImage`, with no `[shader(...)]`
+/// attributes of its own. SPIR-V inputs are never text and never wrapped.
+fn is_shadertoy(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+
+    if bytes.starts_with(b"; SPIR-V") || bytes.starts_with(&SPIRV_MAGIC_LE) {
+        return false;
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+
+    text.contains("mainImage(") && !text.contains("[shader(")
+}
+
+/// The Shadertoy built-in uniforms, as a push-constant block. slangc's
+/// GLSL front-end accepts `layout(push_constant)`, and push constants
+/// need no descriptor sets — only a range in the pipeline layout and one
+/// command per frame. Field order and types must match
+/// [`ShadertoyUniforms`].
+const SHADERTOY_UNIFORM_BLOCK: &str = "\
+layout(push_constant) uniform ShadertoyUniforms
+{
+    vec3  iResolution;      // viewport resolution in pixels (z = 1.0)
+    float iTime;            // seconds since the viewer started
+    vec4  iMouse;           // xy: cursor, zw: last click (origin bottom-left)
+    vec4  iDate;            // year, month, day, seconds into the day (UTC)
+    float iTimeDelta;       // seconds since the previous frame
+    float iFrameRate;       // estimated frames per second
+    int   iFrame;           // frame counter
+};
+";
+
+/// The entry point Shadertoy's environment would inject: call the user's
+/// `mainImage`, translating Vulkan's top-left `gl_FragCoord` into
+/// Shadertoy's bottom-left `fragCoord`.
+const SHADERTOY_EPILOGUE: &str = "\
+layout(location = 0) out vec4 _shadertoy_outColor;
+void main()
+{
+    vec4 _shadertoy_color;
+    mainImage(_shadertoy_color, vec2(gl_FragCoord.x, iResolution.y - gl_FragCoord.y));
+    _shadertoy_outColor = _shadertoy_color;
+}
+";
+
+/// The viewer-owned vertex stage for Shadertoy files: one triangle
+/// spanning the whole viewport, generated from the vertex index because
+/// the viewer supplies no vertex buffer. GLSL keeps it in the same
+/// language as the wrapped fragment stage.
+const SHADERTOY_FULLSCREEN_VERT: &str = "\
+#version 450
+void main(int vertexID: SV_VertexID)
+{
+    vec2 uv = vec2(float((vertexID << 1) & 2), float(vertexID & 2));
+    gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+";
+
+/// Builds a Shadertoy-style `.glsl` file into a fullscreen graphics pass.
+///
+/// The export is wrapped (uniform block + `main()` entry point) and
+/// compiled as the fragment stage; the viewer's fullscreen-triangle vertex
+/// stage is compiled alongside it. Both go through the same per-stage
+/// slangc invocation as a `.vert`/`.frag` pair.
+fn compile_shadertoy(workdir: &Path, source: &SourceFile) -> CompiledShader {
+    let glsl = fs::read_to_string(&source.path).unwrap_or_else(|err| {
+        eprintln!("error: cannot read {}: {err}", source.path.display());
+
+        std::process::exit(1);
+    });
+
+    reject_unsupported_shadertoy(&glsl, &source.display_name);
+
+    let fragment_path = workdir.join("shadertoy.frag");
+
+    fs::write(&fragment_path, wrap_shadertoy(&glsl, &source.display_name))
+        .expect("write wrapped shadertoy source");
+
+    let vertex_path = workdir.join("fullscreen.vert");
+
+    fs::write(&vertex_path, SHADERTOY_FULLSCREEN_VERT).expect("write fullscreen vertex source");
+
+    let vertex = build_stage(&vertex_path, Stage::Vertex);
+
+    let fragment = build_stage(&fragment_path, Stage::Fragment);
+
+    CompiledShader {
+        mode: RenderMode::Graphics {
+            vertex_spirv: vertex.spirv,
+            fragment_spirv: fragment.spirv,
+            vertex_entry: vertex.entry,
+            fragment_entry: fragment.entry,
+            shadertoy: true,
+        },
+    }
+}
+
+/// Rejects Shadertoy inputs the viewer cannot feed: `iChannel*` texture
+/// inputs and `uniform` declarations of the shader's own. Both would
+/// compile into resources the pipeline layout does not provide, so they
+/// are reported up front instead of failing at draw time.
+fn reject_unsupported_shadertoy(source: &str, name: &str) {
+    let stripped = strip_glsl_comments(source);
+
+    for token in stripped.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if token.starts_with("iChannel") {
+            eprintln!(
+                "error: {name} reads the {token} texture input; the viewer supplies no textures yet"
+            );
+
+            std::process::exit(1);
+        }
+
+        if token == "uniform" {
+            eprintln!(
+                "error: {name} declares its own uniforms; the viewer supplies only the Shadertoy built-ins"
+            );
+
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Removes `//` line comments and `/* */` block comments so token scans do
+/// not match words that only appear in comments.
+fn strip_glsl_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+
+    let mut chars = source.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '/' if chars.peek() == Some(&'/') => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+
+                let mut previous = '\0';
+
+                for c in chars.by_ref() {
+                    if previous == '*' && c == '/' {
+                        break;
+                    }
+
+                    previous = c;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+
+    out
+}
+
+/// Wraps a Shadertoy export so slangc's GLSL front-end accepts it.
+///
+/// `#version` must stay on the first line of a GLSL file: the export's own
+/// line is kept when present, otherwise the viewer supplies `#version 450`.
+/// `#line` then resets numbering, so slangc reports errors from the user's
+/// code against the original file name and line numbers.
+fn wrap_shadertoy(source: &str, name: &str) -> String {
+    let trimmed = source.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
+
+    let (version, body) = if trimmed.starts_with("#version") {
+        let end = trimmed.find('\n').unwrap_or(trimmed.len());
+
+        (trimmed[..end].to_string(), &trimmed[end..])
+    } else {
+        ("#version 450".to_string(), trimmed)
+    };
+
+    format!(
+        "{version}\n\
+// --- vert_frag_viewer: Shadertoy prelude (built-in uniforms) ---
+{SHADERTOY_UNIFORM_BLOCK}\
+#line 1 \"{name}\"\n\
+{body}\
+// --- vert_frag_viewer: epilogue (mainImage -> main) ---
+{SHADERTOY_EPILOGUE}"
+    )
+}
+
 /// Loads the SPIR-V and reflection output and selects a display mode.
 ///
 /// Returns `None` when the module compiled but contains nothing the
@@ -696,6 +945,7 @@ fn finish(spirv_path: &Path, reflection_path: &Path) -> Option<CompiledShader> {
                 fragment_spirv: words,
                 vertex_entry: vertex_entry.clone(),
                 fragment_entry: fragment_entry.clone(),
+                shadertoy: false,
             },
         });
     }

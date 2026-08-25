@@ -1,3 +1,4 @@
+use crate::shader::ShadertoyUniforms;
 use crate::vulkan::{device::DeviceBundle, swapchain::SwapchainBundle};
 
 use ash::{Device, vk};
@@ -25,6 +26,7 @@ impl Graphics {
         fragment_module: vk::ShaderModule,
         vertex_entry: &str,
         fragment_entry: &str,
+        shadertoy: bool,
     ) -> Self {
         unsafe {
             let device = &context.device;
@@ -167,7 +169,25 @@ impl Graphics {
                 .logic_op_enable(false)
                 .attachments(&color_blend_attachments);
 
-            let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+            //
+            // Shadertoy shaders read iTime/iResolution/... from a
+            // push-constant block (see shader::ShadertoyUniforms). Push
+            // constants need no descriptor sets or buffers — the block
+            // only has to be declared as a range in the pipeline layout,
+            // visible to the fragment stage that reads it.
+            //
+
+            let push_constant_ranges = [vk::PushConstantRange {
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                offset: 0,
+                size: std::mem::size_of::<ShadertoyUniforms>() as u32,
+            }];
+
+            let pipeline_layout_info = if shadertoy {
+                vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constant_ranges)
+            } else {
+                vk::PipelineLayoutCreateInfo::default()
+            };
 
             let pipeline_layout = device
                 .create_pipeline_layout(&pipeline_layout_info, None)
@@ -231,6 +251,7 @@ impl Graphics {
         command_buffer: vk::CommandBuffer,
         swapchain: &SwapchainBundle,
         image_index: u32,
+        shadertoy: Option<&ShadertoyUniforms>,
     ) {
         unsafe {
             let clear_value = vk::ClearValue {
@@ -261,6 +282,23 @@ impl Graphics {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
             );
+
+            //
+            // The Shadertoy uniforms travel as push constants: written
+            // into the command buffer itself right before the draw, so
+            // every frame carries its own iTime/iMouse values without any
+            // buffer or descriptor to manage.
+            //
+
+            if let Some(uniforms) = shadertoy {
+                device.cmd_push_constants(
+                    command_buffer,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    uniforms.as_bytes(),
+                );
+            }
 
             //
             // HERE!

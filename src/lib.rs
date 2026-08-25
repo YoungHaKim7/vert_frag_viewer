@@ -3,9 +3,10 @@
 //! ## 1. What this program is
 //!
 //! `vert_frag_viewer` is a small Vulkan viewer for Slang shaders. Given a
-//! `.slang` module (a path on the command line, or piped through stdin) or a
-//! `.vert` + `.frag` pair, it compiles the shader at startup, decides from
-//! reflection how to display it, and renders it into a winit window.
+//! `.slang` module (a path on the command line, or piped through stdin), a
+//! `.vert` + `.frag` pair, or a Shadertoy-style `.glsl` file, it compiles the
+//! shader at startup, decides from reflection how to display it, and renders
+//! it into a winit window.
 //!
 //! It is built from:
 //!
@@ -82,6 +83,8 @@
 //!         ▼
 //! compile()            slangc / spirv-as / raw .spv -> SPIR-V + reflection JSON
 //!         │
+//!         ├── module defines mainImage (a Shadertoy export)
+//!         │       ──► wrapped as fullscreen GLSL ──► Graphics + push constants
 //!         ▼
 //! reflection           which entry points and parameters exist?
 //!         │
@@ -359,6 +362,35 @@
 //! (a misnamed dump or binary), it is recovered from the module — the
 //! `OpEntryPoint Vertex/Fragment` keyword in disassembly, or the execution
 //! model of the first entry point in a binary (Vertex = 0, Fragment = 4).
+//!
+//! ### Shadertoy-style `.glsl`
+//!
+//! A Shadertoy export is fragment-only GLSL around
+//! `void mainImage(out vec4 fragColor, in vec2 fragCoord)`, relying on
+//! uniforms (`iTime`, `iResolution`, ...) that Shadertoy's own environment
+//! injects. The viewer detects it by the `mainImage(` definition and wraps
+//! the file instead of compiling it raw:
+//!
+//! ```text
+//! #version 450                        (only when the export has no #version)
+//! layout(push_constant) uniform ShadertoyUniforms { ... iTime, iResolution, ... };
+//! #line 1 "<original file>"           (errors keep the user's name and lines)
+//! <the export, verbatim>
+//! void main() { mainImage(color, bottom-left gl_FragCoord); }
+//! ```
+//!
+//! The wrapped fragment is built with the same `slangc -stage fragment`
+//! invocation a `.frag` pair member uses, alongside a viewer-owned GLSL
+//! vertex stage that emits a fullscreen triangle from `SV_VertexID`.
+//!
+//! The built-ins travel as **push constants** — small (here 60 bytes),
+//! written straight into the command buffer, and needing no descriptor
+//! sets or buffers. The pipeline layout declares one fragment-stage
+//! `VkPushConstantRange`, and every frame writes
+//! `shader::ShadertoyUniforms` (the `repr(C)` mirror of the GLSL block)
+//! with `vkCmdPushConstants` right before the draw. Exports that read
+//! `iChannel*` textures or declare their own `uniform`s are rejected up
+//! front, because nothing could supply those resources at draw time.
 //!
 //! The flow for every input is:
 //!
@@ -879,7 +911,9 @@
 //!    (the compute path already uses them explicitly).
 //! 3. **Descriptor sets** — passing buffers/textures/samplers to shaders (used
 //!    by the compute path).
-//! 4. **Uniform buffers** — passing matrices and other per-frame data.
+//! 4. **Uniform buffers** — passing larger per-frame data. (The Shadertoy
+//!    path already passes its small uniform block via **push constants**;
+//!    uniform buffers are the scalable, descriptor-based mechanism.)
 //! 5. **Vertex buffers** — replacing `SV_VertexID` with explicit vertex data.
 //! 6. **Depth buffers** — adding depth testing.
 //! 7. **Multiple frames in flight** — increasing CPU/GPU overlap.

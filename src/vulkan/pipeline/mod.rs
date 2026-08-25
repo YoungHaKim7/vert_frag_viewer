@@ -2,7 +2,7 @@ mod compute;
 mod graphics;
 
 use super::{device::DeviceBundle, swapchain::SwapchainBundle};
-use crate::shader::RenderMode;
+use crate::shader::{RenderMode, ShadertoyUniforms};
 use ash::{Device, vk};
 
 /// Mode-specific Vulkan objects created around the compiled shader module.
@@ -32,6 +32,7 @@ impl Pipeline {
                     fragment_spirv,
                     vertex_entry,
                     fragment_entry,
+                    shadertoy,
                 } => {
                     let vertex_module = create_shader_module(device, vertex_spirv);
 
@@ -44,6 +45,7 @@ impl Pipeline {
                         fragment_module,
                         vertex_entry,
                         fragment_entry,
+                        *shadertoy,
                     );
 
                     device.destroy_shader_module(vertex_module, None);
@@ -78,18 +80,20 @@ impl Pipeline {
         }
     }
 
-    /// Appends this pipeline's commands to the command buffer.
+    /// Appends this pipeline's commands to the command buffer. For
+    /// Shadertoy shaders, `shadertoy` carries this frame's uniform values.
     pub(crate) unsafe fn record(
         &self,
         device: &Device,
         command_buffer: vk::CommandBuffer,
         swapchain: &SwapchainBundle,
         image_index: u32,
+        shadertoy: Option<&ShadertoyUniforms>,
     ) {
         unsafe {
             match self {
                 Self::Graphics(graphics) => {
-                    graphics.record(device, command_buffer, swapchain, image_index)
+                    graphics.record(device, command_buffer, swapchain, image_index, shadertoy)
                 }
                 Self::Compute(compute) => {
                     compute.record(device, command_buffer, swapchain, image_index)

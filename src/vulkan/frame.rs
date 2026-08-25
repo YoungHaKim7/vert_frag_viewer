@@ -1,4 +1,5 @@
 use super::VulkanApp;
+use crate::shader::ShadertoyUniforms;
 use ash::vk;
 
 impl VulkanApp {
@@ -18,7 +19,13 @@ impl VulkanApp {
     /// `begin -> begin render pass -> bind pipeline -> draw 3 vertices -> end`
     ///
     /// The framebuffer is selected from the acquired swapchain image index.
-    pub(crate) unsafe fn record_command_buffer(&self, image_index: u32) {
+    /// For Shadertoy shaders, `shadertoy` carries this frame's uniform
+    /// values, pushed before the draw.
+    pub(crate) unsafe fn record_command_buffer(
+        &self,
+        image_index: u32,
+        shadertoy: Option<&ShadertoyUniforms>,
+    ) {
         unsafe {
             self.context
                 .device
@@ -30,6 +37,7 @@ impl VulkanApp {
                 self.commands.buffer,
                 &self.swapchain,
                 image_index,
+                shadertoy,
             );
 
             self.context

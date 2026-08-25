@@ -35,6 +35,11 @@ Two display modes are supported:
   fragment entry points and no resource parameters. The viewer draws 3
   vertices; the shader positions them with `SV_VertexID`, so no vertex buffer
   is needed.
+- **Shadertoy GLSL** — a single `.glsl` file written against Shadertoy's
+  `mainImage(fragColor, fragCoord)` convention. The viewer wraps it with the
+  built-in uniforms (`iTime`, `iResolution`, `iMouse`, `iDate`, ...) and a
+  fullscreen-triangle vertex stage, then feeds the uniforms every frame
+  through push constants.
 - **Compute** — a playground-style kernel (`[shader("compute")]`) that writes
   pixels through the Slang Playground's `drawPixel`. The viewer supplies the
   screen-sized output texture and fills any
@@ -58,6 +63,9 @@ cargo r --release ./assets/slang_lang/triangle.slang
 # vertex + fragment pair
 cargo r --release ./assets/triangle.vert ./assets/triangle.frag
 
+# a Shadertoy-style GLSL export (animated fullscreen shader)
+cargo r --release ./assets/glsl_lang/circle.glsl
+
 # playground-style compute demo (2D gaussian splatter)
 cargo r --release ./assets/slang_lang/2d_splatter.slang
 
@@ -70,6 +78,7 @@ cat demo.slang | cargo r --release
 | Input | Formats | How it is built |
 |---|---|---|
 | `.slang` module (path or stdin) | Slang source | one `slangc` invocation for all entry points; if it fails or has nothing displayable, retried with the vendored playground prelude (`import playground; import rendering;`) |
+| Shadertoy `.glsl` (path or stdin) | GLSL source defining `mainImage` | wrapped with the built-in uniforms and a `main()` entry point, compiled as the fragment stage of a fullscreen triangle; the uniforms are fed as push constants every frame |
 | `.vert` + `.frag` pair | Slang/GLSL source | `slangc -stage vertex` / `-stage fragment` |
 | | `spirv-dis` text (`; SPIR-V` header) | reassembled with `spirv-as` |
 | | raw SPIR-V binary (`.spv`) | loaded as-is (entry point assumed `main`) |

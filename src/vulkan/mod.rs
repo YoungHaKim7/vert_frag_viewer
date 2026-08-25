@@ -14,7 +14,7 @@ use swapchain::SwapchainBundle;
 use sync::SyncObjects;
 use winit::window::Window;
 
-use crate::shader::CompiledShader;
+use crate::shader::{CompiledShader, ShadertoyUniforms};
 
 /// Owns every Vulkan object the viewer creates: device context, swapchain,
 /// the mode-specific pipeline (graphics or compute), the reusable command
@@ -107,9 +107,11 @@ impl VulkanApp {
     /// 4. Submit those commands to the graphics queue.
     /// 5. Present the same swapchain image after rendering finishes.
     ///
+    /// For Shadertoy shaders, `shadertoy` carries this frame's uniform
+    /// values; the swapchain extent is the authoritative `iResolution`.
     /// The semaphores establish GPU-to-GPU ordering; the fence establishes
     /// CPU-to-GPU reuse ordering.
-    pub(crate) unsafe fn draw(&self) {
+    pub(crate) unsafe fn draw(&self, mut shadertoy: Option<ShadertoyUniforms>) {
         unsafe {
             self.context
                 .device
@@ -132,7 +134,13 @@ impl VulkanApp {
                 )
                 .expect("acquire image");
 
-            self.record_command_buffer(image_index);
+            if let Some(uniforms) = &mut shadertoy {
+                let extent = self.swapchain.extent;
+
+                uniforms.i_resolution = [extent.width as f32, extent.height as f32, 1.0];
+            }
+
+            self.record_command_buffer(image_index, shadertoy.as_ref());
 
             let wait_semaphores = [self.sync.image_available];
 
