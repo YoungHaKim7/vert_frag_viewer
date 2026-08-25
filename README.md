@@ -98,5 +98,6 @@ misnamed files — by sniffing the `OpEntryPoint` stage from the module.
   order, the compute/blit path), see the crate-level documentation:
   `cargo doc --open`.
 
-# slang viewer
+# slang viewer(only slang file)
+
 - https://github.com/YoungHaKim7/slang_files_viewer_shaders
