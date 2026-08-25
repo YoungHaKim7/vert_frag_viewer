@@ -14,7 +14,7 @@ use swapchain::SwapchainBundle;
 use sync::SyncObjects;
 use winit::window::Window;
 
-use crate::shader::{CompiledShader, ShadertoyUniforms};
+use crate::shader::{CompiledShader, RenderMode, ShadertoyUniforms};
 
 /// Owns every Vulkan object the viewer creates: device context, swapchain,
 /// the mode-specific pipeline (graphics or compute), the reusable command
@@ -74,7 +74,7 @@ impl VulkanApp {
         unsafe {
             let context = DeviceBundle::new(window);
 
-            let swapchain = SwapchainBundle::new(&context);
+            let swapchain = SwapchainBundle::new(&context, window);
 
             //
             // Pipeline for the compiled shader; shader modules are created
@@ -97,6 +97,41 @@ impl VulkanApp {
         }
     }
 
+    /// Rebuilds every extent-dependent Vulkan object after the window has
+    /// been resized.
+    ///
+    /// The swapchain images and views, the framebuffers, the pipeline
+    /// (viewport and scissor are fixed at creation), and — on the compute
+    /// path — the offscreen image and its dispatch dimensions are all
+    /// sized by the swapchain extent, so they are destroyed and rebuilt
+    /// against the window's current size. The device, surface, and command
+    /// pool survive; `device_wait_idle()` makes the swap safe.
+    pub(crate) unsafe fn recreate(&mut self, window: &Window, mode: &RenderMode) {
+        unsafe {
+            self.context
+                .device
+                .device_wait_idle()
+                .expect("wait idle before swapchain recreation");
+
+            // Reverse creation order, mirroring destroy(): the pipeline's
+            // framebuffers reference the swapchain's image views, so the
+            // pipeline is torn down before them.
+            self.sync.destroy(&self.context.device);
+
+            self.pipeline.destroy(&self.context.device);
+
+            self.swapchain.destroy(&self.context.device);
+
+            self.swapchain = SwapchainBundle::new(&self.context, window);
+
+            self.pipeline = Pipeline::new(&self.context, &self.swapchain, mode);
+
+            // One render-finished semaphore per swapchain image; the
+            // image count can change with the new surface capabilities.
+            self.sync = SyncObjects::new(&self.context.device, self.swapchain.images.len());
+        }
+    }
+
     /// Executes one complete frame.
     ///
     /// The CPU/GPU sequence is:
@@ -107,11 +142,21 @@ impl VulkanApp {
     /// 4. Submit those commands to the graphics queue.
     /// 5. Present the same swapchain image after rendering finishes.
     ///
+    /// A swapchain that no longer matches the window (`ERROR_OUT_OF_DATE_KHR`)
+    /// or is merely no longer optimal (`SUBOPTIMAL_KHR`) is rebuilt inline;
+    /// an out-of-date frame is skipped and the next redraw presents at the
+    /// new size.
+    ///
     /// For Shadertoy shaders, `shadertoy` carries this frame's uniform
     /// values; the swapchain extent is the authoritative `iResolution`.
     /// The semaphores establish GPU-to-GPU ordering; the fence establishes
     /// CPU-to-GPU reuse ordering.
-    pub(crate) unsafe fn draw(&self, mut shadertoy: Option<ShadertoyUniforms>) {
+    pub(crate) unsafe fn draw(
+        &mut self,
+        window: &Window,
+        mode: &RenderMode,
+        mut shadertoy: Option<ShadertoyUniforms>,
+    ) {
         unsafe {
             self.context
                 .device
@@ -123,16 +168,24 @@ impl VulkanApp {
                 .reset_fences(&[self.sync.in_flight])
                 .expect("reset fence");
 
-            let (image_index, _) = self
-                .swapchain
-                .loader
-                .acquire_next_image(
-                    self.swapchain.swapchain,
-                    u64::MAX,
-                    self.sync.image_available,
-                    vk::Fence::null(),
-                )
-                .expect("acquire image");
+            let (image_index, suboptimal) = match self.swapchain.loader.acquire_next_image(
+                self.swapchain.swapchain,
+                u64::MAX,
+                self.sync.image_available,
+                vk::Fence::null(),
+            ) {
+                Ok(acquired) => acquired,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate(window, mode);
+                    return;
+                }
+                Err(error) => panic!("acquire image: {error}"),
+            };
+
+            if suboptimal {
+                self.recreate(window, mode);
+                return;
+            }
 
             if let Some(uniforms) = &mut shadertoy {
                 let extent = self.swapchain.extent;
@@ -174,10 +227,22 @@ impl VulkanApp {
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
-            self.swapchain
+            let suboptimal = match self
+                .swapchain
                 .loader
                 .queue_present(self.context.queue, &present_info)
-                .expect("queue present");
+            {
+                Ok(suboptimal) => suboptimal,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate(window, mode);
+                    return;
+                }
+                Err(error) => panic!("queue present: {error}"),
+            };
+
+            if suboptimal {
+                self.recreate(window, mode);
+            }
         }
     }
 }

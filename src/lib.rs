@@ -212,9 +212,10 @@
 //!
 //! - **format**: `B8G8R8A8_UNORM` when the surface offers it, otherwise the
 //!   first reported format;
-//! - **extent**: the surface's current extent, falling back to the window
-//!   size (800×600) when the window system does not fix one
-//!   (`current_extent.width == u32::MAX`);
+//! - **extent**: the surface's current extent, falling back to the window's
+//!   current size when the window system does not fix one
+//!   (`current_extent.width == u32::MAX`), clamped to the surface's
+//!   min/max image extent;
 //! - **present mode**: `MAILBOX` when available, otherwise the mandatory `FIFO`;
 //! - **image count**: `min_image_count + 1`, clamped to `max_image_count`
 //!   when the surface enforces a maximum.
@@ -917,8 +918,9 @@
 //! 5. **Vertex buffers** — replacing `SV_VertexID` with explicit vertex data.
 //! 6. **Depth buffers** — adding depth testing.
 //! 7. **Multiple frames in flight** — increasing CPU/GPU overlap.
-//! 8. **Swapchain recreation** — handling window resizing and `OUT_OF_DATE_KHR`
-//!    (the viewer currently creates a fixed, non-resizable window instead).
+//! 8. **Swapchain recreation** — how a resized window drives `OUT_OF_DATE_KHR`
+//!    and `SUBOPTIMAL_KHR` handling (the viewer rebuilds the swapchain and the
+//!    extent-dependent objects on resize).
 //! 9. **Command buffer reuse** — reducing per-frame recording overhead.
 //! 10. **Vulkan validation layers** — catching incorrect API usage during development.
 //!

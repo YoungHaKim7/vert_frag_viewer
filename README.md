@@ -88,7 +88,8 @@ misnamed files — by sniffing the `OpEntryPoint` stage from the module.
 
 # Notes
 
-- The window is fixed at 800×600 and not resizable (no swapchain recreation yet).
+- The window opens at 1600×1200 and is freely resizable (the swapchain and the
+  extent-dependent objects are rebuilt on resize).
 - Rendering runs continuously (a redraw is requested on every event-loop turn).
 - The window title shows the viewed file name(s).
 - Compilation happens before the window opens; the scratch directory is

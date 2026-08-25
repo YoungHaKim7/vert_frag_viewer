@@ -17,10 +17,9 @@ use winit::{
 use shader::ParamKind;
 use winit::event_loop::EventLoop;
 
-/// Window size; also the swapchain's fallback extent when the surface
-/// does not report one.
-pub(crate) const WIDTH: u32 = 800;
-pub(crate) const HEIGHT: u32 = 600;
+/// Initial window size; the window can be resized freely afterwards.
+pub(crate) const WIDTH: u32 = 1600;
+pub(crate) const HEIGHT: u32 = 1200;
 
 /// Creates the event loop and runs the application until the window closes.
 pub fn run() {
@@ -76,6 +75,11 @@ pub(crate) struct App {
     /// CPU-side state behind the Shadertoy uniforms; only present when the
     /// viewed shader is Shadertoy-style GLSL.
     shadertoy: Option<ShadertoyClock>,
+
+    /// Set by `Resized`; consumed by the next `RedrawRequested`, which
+    /// rebuilds the swapchain once per frame instead of once per resize
+    /// event (a drag emits many).
+    resize_pending: bool,
 }
 
 impl App {
@@ -98,6 +102,7 @@ impl App {
             shader_name,
             compiled: Some(compiled),
             shadertoy,
+            resize_pending: false,
         }
     }
 }
@@ -220,8 +225,7 @@ impl ApplicationHandler for App {
         let attributes = WindowAttributes::default()
             .with_title(format!("Slang Viewer — {}", self.shader_name))
             .with_inner_size(LogicalSize::new(WIDTH, HEIGHT))
-            // The viewer does not recreate the swapchain on resize yet.
-            .with_resizable(false);
+            .with_resizable(true);
 
         let window = event_loop.create_window(attributes).expect("window");
 
@@ -275,13 +279,32 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::Resized(size) => {
+                // A minimized window reports 0×0; there is nothing to
+                // rebuild into until it is restored.
+                if size.width > 0 && size.height > 0 {
+                    self.resize_pending = true;
+                }
+            }
+
             WindowEvent::RedrawRequested => {
-                if let Some(vulkan) = &self.vulkan {
+                if let (Some(vulkan), Some(window), Some(compiled)) =
+                    (&mut self.vulkan, &self.window, &self.compiled)
+                {
+                    // Still minimized: presenting has no target.
+                    if window.inner_size().width == 0 || window.inner_size().height == 0 {
+                        return;
+                    }
+
+                    if self.resize_pending {
+                        self.resize_pending = false;
+
+                        unsafe { vulkan.recreate(window, &compiled.mode) };
+                    }
+
                     let shadertoy = self.shadertoy.as_mut().map(|clock| clock.tick());
 
-                    unsafe {
-                        vulkan.draw(shadertoy);
-                    }
+                    unsafe { vulkan.draw(window, &compiled.mode, shadertoy) };
                 }
             }
 

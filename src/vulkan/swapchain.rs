@@ -1,7 +1,6 @@
-use crate::app::{HEIGHT, WIDTH};
-
 use super::device::DeviceBundle;
 use ash::{khr::swapchain, vk};
+use winit::window::Window;
 
 pub(crate) struct SwapchainBundle {
     pub(crate) loader: swapchain::Device,
@@ -16,7 +15,7 @@ pub(crate) struct SwapchainBundle {
 }
 
 impl SwapchainBundle {
-    pub(crate) unsafe fn new(context: &DeviceBundle) -> Self {
+    pub(crate) unsafe fn new(context: &DeviceBundle, window: &Window) -> Self {
         unsafe {
             //
             // ------------------------------------------------------------
@@ -44,13 +43,38 @@ impl SwapchainBundle {
                 .find(|format| format.format == vk::Format::B8G8R8A8_UNORM)
                 .unwrap_or(formats[0]);
 
+            // Most window systems (X11) fix the extent themselves; when
+            // they do not (Wayland reports u32::MAX), the window's
+            // current pixel size is the right choice — and the only one
+            // that tracks a live resize.
+            let window_size = window.inner_size();
+
             let extent = if capabilities.current_extent.width != u32::MAX {
                 capabilities.current_extent
             } else {
                 vk::Extent2D {
-                    width: WIDTH,
-                    height: HEIGHT,
+                    width: window_size.width,
+                    height: window_size.height,
                 }
+            };
+
+            // Whatever the source, the surface constrains the allowed
+            // range (a 0- or 1-pixel edge case would be rejected below).
+            let extent = vk::Extent2D {
+                width: extent
+                    .width
+                    .clamp(
+                        capabilities.min_image_extent.width,
+                        capabilities.max_image_extent.width,
+                    )
+                    .max(1),
+                height: extent
+                    .height
+                    .clamp(
+                        capabilities.min_image_extent.height,
+                        capabilities.max_image_extent.height,
+                    )
+                    .max(1),
             };
 
             let present_modes = context
